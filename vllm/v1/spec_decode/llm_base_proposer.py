@@ -14,7 +14,7 @@ from vllm.config import (
     get_layers_from_vllm_config,
     replace,
 )
-from vllm.distributed.parallel_state import get_pp_group
+from vllm.distributed.parallel_state import get_dcp_group, get_pp_group
 from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -31,6 +31,7 @@ from vllm.utils.torch_utils import PIN_MEMORY, async_tensor_h2d
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.attention.backends.triton_attn import TritonAttentionMetadata
+from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import KVCacheConfig, UniformTypeKVCacheSpecs
 from vllm.v1.sample.metadata import SamplingMetadata
@@ -78,6 +79,12 @@ class SpecDecodeBaseProposer:
         self.dtype = vllm_config.model_config.dtype
         self.max_model_len = vllm_config.model_config.max_model_len
         self.dp_rank = vllm_config.parallel_config.data_parallel_rank
+        # DCP context for recomputing dcp_local_seq_lens on the draft path
+        # (see prepare_inputs); mirrors gpu_model_runner initialization.
+        parallel_config = vllm_config.parallel_config
+        self.dcp_world_size = parallel_config.decode_context_parallel_size
+        self.dcp_rank = 0 if self.dcp_world_size <= 1 else get_dcp_group().rank_in_group
+        self.cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
         self.num_speculative_tokens = self.speculative_config.num_speculative_tokens
 
         # We need to get the hidden size from the draft model config because
@@ -1117,6 +1124,30 @@ class SpecDecodeBaseProposer:
             common_attn_metadata.seq_lens_cpu_upper_bound - num_rejected_tokens
         )
 
+        # DCP: the draft's seq_lens were adjusted by num_rejected_tokens
+        # (new_seq_lens_cpu above), but dcp_local_seq_lens was forwarded from
+        # the target model (un-adjusted) -> stale local shard bound, which
+        # degrades the sparse indexer's top-k quality and thus MTP acceptance.
+        # Recompute from the draft's own seq_lens, mirroring gpu_model_runner's
+        # get_dcp_local_seq_lens call. No-op when DCP is off (forward the
+        # target's tensors unchanged).
+        if (
+            common_attn_metadata.dcp_local_seq_lens is not None
+            and self.dcp_world_size > 1
+        ):
+            new_dcp_local_seq_lens_cpu = get_dcp_local_seq_lens(
+                new_seq_lens_cpu,
+                self.dcp_world_size,
+                self.dcp_rank,
+                self.cp_kv_cache_interleave_size,
+            )
+            new_dcp_local_seq_lens = new_dcp_local_seq_lens_cpu.to(
+                device, non_blocking=True
+            )
+        else:
+            new_dcp_local_seq_lens_cpu = common_attn_metadata.dcp_local_seq_lens_cpu
+            new_dcp_local_seq_lens = common_attn_metadata.dcp_local_seq_lens
+
         # [0, q1, q1 + q2, q1 + q2 + q3] -> [q1, q2, q3]
         new_query_len_per_req = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
         # [q1, q2, q3] -> [q1 - n1, q2 - n2, q3 - n3]
@@ -1177,8 +1208,8 @@ class SpecDecodeBaseProposer:
             block_table_tensor=common_attn_metadata.block_table_tensor,
             slot_mapping=common_attn_metadata.slot_mapping[token_indices],
             causal=True,
-            dcp_local_seq_lens=common_attn_metadata.dcp_local_seq_lens,
-            dcp_local_seq_lens_cpu=common_attn_metadata.dcp_local_seq_lens_cpu,
+            dcp_local_seq_lens=new_dcp_local_seq_lens,
+            dcp_local_seq_lens_cpu=new_dcp_local_seq_lens_cpu,
         )
 
         return spec_common_attn_metadata, token_indices
