@@ -220,6 +220,10 @@ class DeepseekV32IndexerMetadata:
     # top-k (see sparse_attn_indexer).
     dcp_world_size: int = 1
     cp_rank: int = 0
+    # "exact": ranks all-gather local top-k and recompute a single global
+    # top-k; "union" (default): each rank keeps its local top-k, reconciled by
+    # the LSE merge (no extra collective). See sparse_attn_indexer.
+    sparse_indexer_mode: str = "union"
 
 
 def get_max_prefill_buffer_size(vllm_config: VllmConfig):
@@ -337,6 +341,12 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         # Get compress_ratio for DeepseekV4 support
         if isinstance(self.kv_cache_spec, MLAAttentionSpec):
             self.compress_ratio = self.kv_cache_spec.compress_ratio
+
+        # DCP sparse indexer top-k selection mode (exact vs union); read once
+        # and threaded into the indexer metadata (see sparse_attn_indexer).
+        self.sparse_indexer_mode = (
+            self.vllm_config.parallel_config.dcp_sparse_indexer_mode
+        )
 
         # Pre-allocate buffers for CUDA graph compatibility when
         if self.compress_ratio > 1:
@@ -536,9 +546,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 # that case so prefill chunking (which needs CPU seq lens to
                 # avoid a sync in the chunk loop) still works.
                 if common_attn_metadata.dcp_local_seq_lens_cpu is not None:
-                    local_seq_lens_cpu = (
-                        common_attn_metadata.dcp_local_seq_lens_cpu
-                    )
+                    local_seq_lens_cpu = common_attn_metadata.dcp_local_seq_lens_cpu
                 else:
                     local_seq_lens_cpu = local_seq_lens.cpu()
                 global_seq_lens = seq_lens
@@ -731,6 +739,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             decode=decode_metadata,
             dcp_world_size=dcp_world_size,
             cp_rank=cp_rank,
+            sparse_indexer_mode=self.sparse_indexer_mode,
         )
 
         return attn_metadata
@@ -873,9 +882,7 @@ def _build_prefill_chunk_metadata_kernel(
         if DCP_WORLD_SIZE == 1:
             seq_len_per_token = (P + 1) // COMPRESS_RATIO
         else:
-            local_uncompressed_ke = (P + DCP_WORLD_SIZE - cp_rank) // (
-                DCP_WORLD_SIZE
-            )
+            local_uncompressed_ke = (P + DCP_WORLD_SIZE - cp_rank) // (DCP_WORLD_SIZE)
             seq_len_per_token = local_uncompressed_ke // COMPRESS_RATIO
         tl.store(
             cu_compressed_seq_len_ke_ptr + out_pos,

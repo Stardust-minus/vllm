@@ -147,6 +147,17 @@ def sparse_attn_indexer(
     has_prefill = attn_metadata_narrowed.num_prefills > 0
     num_decode_tokens = attn_metadata_narrowed.num_decode_tokens
 
+    # DCP sparse indexer top-k mode. "exact": ranks all-gather local top-k
+    # candidates and recompute the global top-k (one extra all_gather per
+    # step, identical token set across dcp_world_size). "union" (default):
+    # each rank keeps its local top-k as global positions; the per-rank
+    # selections (a superset of the global top-k) are reconciled by the
+    # cross-rank LSE merge with no extra collective.
+    exact_merge = (
+        attn_metadata_narrowed.dcp_world_size > 1
+        and attn_metadata_narrowed.sparse_indexer_mode == "exact"
+    )
+
     # q_scale is required iff the FP4 cache path is enabled; the FP8 path
     # folds the Q scale into `weights` inside fused_indexer_q_rope_quant.
     if use_fp4_cache:
@@ -273,9 +284,9 @@ def sparse_attn_indexer(
                 # rank r for a token attending [0, r)) must contribute nothing
                 # — top_k_per_row_prefill may not emit -1 for an empty range,
                 # so mask by the explicit valid count.
-                local_valid = (
-                    chunk.cu_seqlen_ke - chunk.cu_seqlen_ks
-                )[:num_rows].to(torch.int32)
+                local_valid = (chunk.cu_seqlen_ke - chunk.cu_seqlen_ks)[:num_rows].to(
+                    torch.int32
+                )
                 invalid = invalid | (idx_safe >= local_valid.unsqueeze(1))
                 local_scores = torch.gather(
                     logits.float(), 1, idx_safe.to(torch.int64)
@@ -284,36 +295,45 @@ def sparse_attn_indexer(
                 global_pos = torch.where(
                     invalid, torch.full_like(global_pos, -1), global_pos
                 )
-                T = num_rows
-                K = topk_tokens
-                cand = torch.stack(
-                    [global_pos, local_scores.to(torch.float32)], dim=-1
-                )  # [T, K, 2]
-                cand_all = get_dcp_group().all_gather(cand, dim=0).view(
-                    dcp_ws, T, K, 2
-                )
-                # [dcp_ws, T, K] -> [T, dcp_ws*K]: per row, rank0's K then
-                # rank1's K, ... so a global top-K over the concatenated
-                # candidates is correct. permute before reshape (a bare
-                # reshape would interleave rows across ranks).
-                gp = cand_all[..., 0].permute(1, 0, 2).reshape(T, dcp_ws * K)
-                sc = cand_all[..., 1].permute(1, 0, 2).reshape(T, dcp_ws * K)
-                # Deterministic total-order key (see decode merge below): fp8
-                # logits tie often, and plain torch.topk breaks ties
-                # nondeterministically per-rank, so ranks can select different
-                # global token sets. Pack score bits (high 32) and ~global_pos
-                # (low 32, lowest position wins) into an int64 key biased by
-                # 2**63 so signed topk compares unsigned.
-                sc_bits = sc.view(torch.int32)
-                not_bits = sc_bits.bitwise_not()
-                ordered = torch.where(sc_bits < 0, not_bits, sc_bits ^ 0x80000000)
-                high = ordered.to(torch.uint32).to(torch.int64) << 32
-                low = (~gp.to(torch.int32)).to(torch.int64) & 0xFFFFFFFF
-                key = (high | low) + (1 << 63)
-                _, sel = torch.topk(key, K, dim=1)  # [T, K], deterministic
-                topk_indices.copy_(
-                    torch.gather(gp, 1, sel.to(torch.int64)).to(torch.int32)
-                )
+                if exact_merge:
+                    T = num_rows
+                    K = topk_tokens
+                    cand = torch.stack(
+                        [global_pos, local_scores.to(torch.float32)], dim=-1
+                    )  # [T, K, 2]
+                    cand_all = (
+                        get_dcp_group().all_gather(cand, dim=0).view(dcp_ws, T, K, 2)
+                    )
+                    # [dcp_ws, T, K] -> [T, dcp_ws*K]: per row, rank0's K then
+                    # rank1's K, ... so a global top-K over the concatenated
+                    # candidates is correct. permute before reshape (a bare
+                    # reshape would interleave rows across ranks).
+                    gp = cand_all[..., 0].permute(1, 0, 2).reshape(T, dcp_ws * K)
+                    sc = cand_all[..., 1].permute(1, 0, 2).reshape(T, dcp_ws * K)
+                    # Deterministic total-order key (see decode merge below):
+                    # fp8 logits tie often, and plain torch.topk breaks ties
+                    # nondeterministically per-rank, so ranks can select
+                    # different global token sets. Pack score bits (high 32)
+                    # and ~global_pos (low 32, lowest position wins) into an
+                    # int64 key biased by 2**63 so signed topk compares
+                    # unsigned.
+                    sc_bits = sc.view(torch.int32)
+                    not_bits = sc_bits.bitwise_not()
+                    ordered = torch.where(sc_bits < 0, not_bits, sc_bits ^ 0x80000000)
+                    high = ordered.to(torch.uint32).to(torch.int64) << 32
+                    low = (~gp.to(torch.int32)).to(torch.int64) & 0xFFFFFFFF
+                    key = (high | low) + (1 << 63)
+                    _, sel = torch.topk(key, K, dim=1)  # [T, K], deterministic
+                    topk_indices.copy_(
+                        torch.gather(gp, 1, sel.to(torch.int64)).to(torch.int32)
+                    )
+                else:
+                    # union: keep this rank's local top-k as global positions.
+                    # All are owned by this rank (cp_rank + idx*dcp_ws), so the
+                    # slot conversion below does not pad them; the per-rank
+                    # selections (a superset of the global top-k) are
+                    # reconciled by the LSE merge with no extra collective.
+                    topk_indices.copy_(global_pos.to(torch.int32))
 
     if has_decode:
         decode_metadata = attn_metadata_narrowed.decode
@@ -437,9 +457,7 @@ def sparse_attn_indexer(
             # topk_tokens and may emit indices >= seq_lens. Mask by the
             # explicit valid count so they map to -1 instead of an out-of-range
             # global position (cp_rank + idx*dcp_ws).
-            local_valid = seq_lens.reshape(-1)[: topk_indices.shape[0]].to(
-                torch.int32
-            )
+            local_valid = seq_lens.reshape(-1)[: topk_indices.shape[0]].to(torch.int32)
             invalid = invalid | (idx_safe >= local_valid.unsqueeze(1))
             local_scores = torch.gather(
                 logits.float(), 1, idx_safe.to(torch.int64)
@@ -448,43 +466,53 @@ def sparse_attn_indexer(
             global_pos = torch.where(
                 invalid, torch.full_like(global_pos, -1), global_pos
             )
-            T = topk_indices.shape[0]
-            K = topk_tokens
-            cand = torch.stack(
-                [global_pos, local_scores.to(torch.float32)], dim=-1
-            )  # [T, K, 2]
-            cand_all = get_dcp_group().all_gather(cand, dim=0).view(
-                dcp_ws, T, K, 2
-            )
-            gp = cand_all[..., 0].permute(1, 0, 2).reshape(T, dcp_ws * K)
-            sc = cand_all[..., 1].permute(1, 0, 2).reshape(T, dcp_ws * K)
-            # DCP correctness: every rank independently selects the global
-            # top-K from the same all-gathered candidates, so the selected
-            # SET must be identical across ranks. fp8 indexer scores have few
-            # distinct values, so ties are common; plain torch.topk breaks
-            # ties nondeterministically per-launch, so ranks can pick
-            # different tied candidates -> each rank's sparse_utils kernel
-            # filters a different global token set -> LSE-merged output is
-            # inconsistent -> intermittent garbled tokens (0.1-0.5%, long
-            # context where boundary ties are more likely).
-            #
-            # Build a strict total order as an int64 key: the score's
-            # monotone uint32 bits in the high 32 bits (higher score -> larger
-            # key), and ~global_pos in the low 32 bits (lowest global position
-            # wins among equal scores, matching a stable sort). torch.topk is
-            # signed, so bias by 2**63 to make the comparison unsigned (the
-            # high bit set after ^SIGN would otherwise look negative). All
-            # ranks compute identical keys, so topk is deterministic and
-            # rank-agnostic. Invalid candidates (score=-inf, gp=-1) map to the
-            # minimum key and sort last naturally -- no special-casing.
-            sc_bits = sc.view(torch.int32)
-            not_bits = sc_bits.bitwise_not()
-            ordered = torch.where(sc_bits < 0, not_bits, sc_bits ^ 0x80000000)
-            high = ordered.to(torch.uint32).to(torch.int64) << 32
-            low = (~gp.to(torch.int32)).to(torch.int64) & 0xFFFFFFFF
-            key = (high | low) + (1 << 63)
-            _, sel = torch.topk(key, K, dim=1)  # [T, K], deterministic
-            topk_indices.copy_(torch.gather(gp, 1, sel.to(torch.int64)).to(torch.int32))
+            if exact_merge:
+                T = topk_indices.shape[0]
+                K = topk_tokens
+                cand = torch.stack(
+                    [global_pos, local_scores.to(torch.float32)], dim=-1
+                )  # [T, K, 2]
+                cand_all = get_dcp_group().all_gather(cand, dim=0).view(dcp_ws, T, K, 2)
+                gp = cand_all[..., 0].permute(1, 0, 2).reshape(T, dcp_ws * K)
+                sc = cand_all[..., 1].permute(1, 0, 2).reshape(T, dcp_ws * K)
+                # DCP correctness: every rank independently selects the global
+                # top-K from the same all-gathered candidates, so the selected
+                # SET must be identical across ranks. fp8 indexer scores have
+                # few distinct values, so ties are common; plain torch.topk
+                # breaks ties nondeterministically per-launch, so ranks can
+                # pick different tied candidates -> each rank's sparse_utils
+                # kernel filters a different global token set -> LSE-merged
+                # output is inconsistent -> intermittent garbled tokens
+                # (0.1-0.5%, long context where boundary ties are more
+                # likely).
+                #
+                # Build a strict total order as an int64 key: the score's
+                # monotone uint32 bits in the high 32 bits (higher score ->
+                # larger key), and ~global_pos in the low 32 bits (lowest
+                # global position wins among equal scores, matching a stable
+                # sort). torch.topk is signed, so bias by 2**63 to make the
+                # comparison unsigned (the high bit set after ^SIGN would
+                # otherwise look negative). All ranks compute identical keys,
+                # so topk is deterministic and rank-agnostic. Invalid
+                # candidates (score=-inf, gp=-1) map to the minimum key and
+                # sort last naturally -- no special-casing.
+                sc_bits = sc.view(torch.int32)
+                not_bits = sc_bits.bitwise_not()
+                ordered = torch.where(sc_bits < 0, not_bits, sc_bits ^ 0x80000000)
+                high = ordered.to(torch.uint32).to(torch.int64) << 32
+                low = (~gp.to(torch.int32)).to(torch.int64) & 0xFFFFFFFF
+                key = (high | low) + (1 << 63)
+                _, sel = torch.topk(key, K, dim=1)  # [T, K], deterministic
+                topk_indices.copy_(
+                    torch.gather(gp, 1, sel.to(torch.int64)).to(torch.int32)
+                )
+            else:
+                # union: keep this rank's local top-k as global positions. All
+                # are owned (cp_rank + idx*dcp_ws); the slot conversion does
+                # not pad them, and the LSE merge reconciles the per-rank
+                # selections (a superset of the global top-k) with no extra
+                # collective.
+                topk_indices.copy_(global_pos.to(torch.int32))
 
         if decode_metadata.requires_padding:
             # if padded, we need to unpack
