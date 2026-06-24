@@ -275,9 +275,18 @@ class CudagraphDispatcher:
             not self.keys_initialized
             or self.cudagraph_mode == CUDAGraphMode.NONE
             or max_size is None
-            or num_tokens > max_size
             or allowed_modes <= {CUDAGraphMode.NONE}
         ):
+            return CUDAGraphMode.NONE, BatchDescriptor(num_tokens)
+
+        if num_tokens > max_size:
+            logger.warning_once(
+                "num_tokens (%d) exceeds max_cudagraph_capture_size (%d); "
+                "falling back to eager path (much slower).",
+                num_tokens,
+                max_size,
+                scope="global",
+            )
             return CUDAGraphMode.NONE, BatchDescriptor(num_tokens)
 
         effective_num_active_loras = num_active_loras
