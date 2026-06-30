@@ -15,6 +15,7 @@ from vllm.config import (
     get_layers_from_vllm_config,
     replace,
 )
+from vllm.distributed.eplb.eplb_state import EplbState
 from vllm.distributed.parallel_state import get_dcp_group, get_pp_group
 from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
@@ -86,6 +87,7 @@ class SpecDecodeBaseProposer:
         self.dcp_world_size = parallel_config.decode_context_parallel_size
         self.dcp_rank = 0 if self.dcp_world_size <= 1 else get_dcp_group().rank_in_group
         self.cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
+        self.eplb_state: EplbState | None = None
         self.num_speculative_tokens = self.speculative_config.num_speculative_tokens
 
         # We need to get the hidden size from the draft model config because
@@ -335,6 +337,10 @@ class SpecDecodeBaseProposer:
                 "does not support M-RoPE yet"
             )
 
+    def set_eplb_state(self, eplb_state: EplbState) -> None:
+        """Inject EPLB state after construction."""
+        self.eplb_state = eplb_state
+
     def _init_parallel_drafting_params(self):
         # For parallel drafting, we need the token ID to use for masked slots
         # And for EAGLE + parallel drafting, we need the hidden state tensor to use
@@ -534,6 +540,12 @@ class SpecDecodeBaseProposer:
         if self._share_mtp_indices and hasattr(self.model.model, "set_skip_topk"):
             self.model.model.set_skip_topk(False)
 
+        if self.eplb_state is not None:
+            self.eplb_state.prepare_forward(
+                self.draft_model_config,
+                num_tokens,
+            )
+
         with set_forward_context(
             per_layer_attn_metadata,
             self.vllm_config,
@@ -678,6 +690,12 @@ class SpecDecodeBaseProposer:
             }
             if self.pass_hidden_states_to_model:
                 model_kwargs["hidden_states"] = self.hidden_states[:input_batch_size]
+
+            if self.eplb_state is not None:
+                self.eplb_state.prepare_forward(
+                    self.draft_model_config,
+                    batch_size,
+                )
 
             with set_forward_context(
                 per_layer_attn_metadata,

@@ -53,6 +53,16 @@ class OffloadingConnectorWorker:
         kv_cache_config = self.spec.kv_cache_config
         num_blocks = kv_cache_config.num_blocks
 
+        # Packed layouts (e.g. DSv4) set block_stride > 0; their tensors use
+        # stride(0) as the manager-block stride (equals total_num_bytes_per_block).
+        # General (non-packed) layouts size the tensor at page_size_bytes per
+        # manager block, so page_size_bytes is the correct offloading stride.
+        layer_is_packed: dict[str, bool] = {
+            ln: bool(kv_tensor.block_stride)
+            for kv_tensor in kv_cache_config.kv_cache_tensors
+            for ln in kv_tensor.shared_by
+        }
+
         # layer_name -> (num_blocks, page_size_bytes) tensor
         tensors_per_block: dict[str, tuple[torch.Tensor, ...]] = {}
         # layer_name -> size of (un-padded) page in bytes
@@ -77,7 +87,11 @@ class OffloadingConnectorWorker:
                     page = layer_kv_cache_spec.page_size_bytes
                     elem_size = layer_kv_cache.element_size()
                     byte_offset = layer_kv_cache.storage_offset() * elem_size
-                    block_stride_bytes = layer_kv_cache.stride(0) * elem_size
+                    block_stride_bytes = (
+                        layer_kv_cache.stride(0) * elem_size
+                        if layer_is_packed[layer_name]
+                        else page
+                    )
                     tensors_per_block[layer_name] = (
                         torch.tensor(
                             [],
@@ -124,13 +138,14 @@ class OffloadingConnectorWorker:
                     raise NotImplementedError
 
         packed_kv_cache_tensor = next(
-            (t for t in kv_cache_config.kv_cache_tensors if t.block_stride), None
+            (
+                t
+                for t in kv_cache_config.kv_cache_tensors
+                if t.block_stride and t.shared_by
+            ),
+            None,
         )
-        is_dsv4 = all(
-            isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
-            for group in kv_cache_config.kv_cache_groups
-        )
-        if packed_kv_cache_tensor is not None and not is_dsv4:
+        if packed_kv_cache_tensor is not None:
             (tensor,) = tensors_per_block[packed_kv_cache_tensor.shared_by[0]]
             block_stride = tensor.stride(0)
             packed_tensor = tensor.as_strided(
@@ -153,7 +168,7 @@ class OffloadingConnectorWorker:
         block_data_refs: dict[str, list[CanonicalKVCacheRef]] = defaultdict(list)
         for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
             # Filter to layers that were actually processed above.
-            # _get_kv_cache_config_deepseek_v4 emits KVCacheTensor entries for
+            # Packed KV allocation emits KVCacheTensor entries for
             # every (tuple_idx, page_size) slot; slots where no group has a
             # layer at that index produce an empty shared_by (reserved memory
             # with no corresponding model layer).
